@@ -1,0 +1,270 @@
+diff --git a/Makefile b/Makefile
+index b262c0a..e3b1392 100644
+--- a/Makefile
++++ b/Makefile
+@@ -145,6 +145,7 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_test_scheduler\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -166,7 +167,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22a5401..4b3df7c 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -146,6 +146,10 @@ found:
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
++  // Initialize tickets and rounds for lottery scheduling
++  p->tickets = 10;  // Default tickets (init process gets 10)
++  p->rounds = 0;    // Initially zero rounds
++
+   return p;
+ }
+ 
+@@ -290,6 +294,9 @@ kfork(void)
+ 
+   safestrcpy(np->name, p->name, sizeof(p->name));
+ 
++  // Child inherits tickets from parent
++  np->tickets = p->tickets;
++
+   pid = np->pid;
+ 
+   release(&np->lock);
+@@ -414,10 +421,34 @@ kwait(uint64 addr)
+   }
+ }
+ 
++// Random number generator for lottery scheduling
++int
++do_rand(unsigned long *ctx)
++{
++  long hi, lo, x;
++  x = (*ctx % 0x7ffffffe) + 1;
++  hi = x / 127773;
++  lo = x % 127773;
++  x = 16807 * lo - 2836 * hi;
++  if (x < 0)
++    x += 0x7fffffff;
++  x--;
++  *ctx = x;
++  return (x);
++}
++
++unsigned long rand_next = 1;
++
++int
++rand(void)
++{
++  return (do_rand(&rand_next));
++}
++
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+ // Scheduler never returns.  It loops, doing:
+-//  - choose a process to run.
++//  - choose a process to run using lottery scheduling.
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
+@@ -437,24 +468,49 @@ scheduler(void)
+     intr_on();
+     intr_off();
+ 
++    // Lottery scheduling implementation
+     int found = 0;
++    
++    // First, calculate total tickets of all RUNNABLE processes
++    int total_tickets = 0;
+     for(p = proc; p < &proc[NPROC]; p++) {
+       acquire(&p->lock);
+       if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
++        total_tickets += p->tickets;
+       }
+       release(&p->lock);
+     }
++
++    // If there are runnable processes, pick one using lottery scheduling
++    if(total_tickets > 0) {
++      // Generate a random winning ticket in range [0, total_tickets - 1]
++      int winning_ticket = rand() % total_tickets;
++      int ticket_count = 0;
++      
++      // Find the process that owns the winning ticket
++      for(p = proc; p < &proc[NPROC]; p++) {
++        acquire(&p->lock);
++        if(p->state == RUNNABLE) {
++          ticket_count += p->tickets;
++          if(ticket_count > winning_ticket) {
++            // This process wins the lottery
++            p->state = RUNNING;
++            p->rounds++;  // Increment rounds counter
++            c->proc = p;
++            swtch(&c->context, &p->context);
++
++            // Process is done running for now.
++            // It should have changed its p->state before coming back.
++            c->proc = 0;
++            found = 1;
++            release(&p->lock);
++            break;
++          }
++        }
++        release(&p->lock);
++      }
++    }
++    
+     if(found == 0) {
+       // nothing to run; stop running on this core until an interrupt.
+       asm volatile("wfi");
+@@ -684,7 +740,7 @@ procdump(void)
+       state = states[p->state];
+     else
+       state = "???";
+-    printf("%d %s %s", p->pid, state, p->name);
++    printf("%d %s %s tickets=%d rounds=%d", p->pid, state, p->name, p->tickets, p->rounds);
+     printf("\n");
+   }
+ }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..65055c3 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,6 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int tickets;                 // Number of tickets for lottery scheduling
++  int rounds;                  // Number of times scheduled
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 076d965..e8daf8c 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_settickets(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +127,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_settickets] sys_settickets,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 3dd926d..055f698 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_settickets 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 419e727..3b6c45f 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -107,3 +107,14 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_settickets(void)
++{
++  int n;
++  argint(0, &n);
++  if(n < 1)
++    return -1;
++  myproc()->tickets = n;
++  return 0;
++}
+diff --git a/user/test_scheduler.c b/user/test_scheduler.c
+new file mode 100644
+index 0000000..ffe4f88
+--- /dev/null
++++ b/user/test_scheduler.c
+@@ -0,0 +1,32 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  if(argc != 2){
++    fprintf(2, "Usage: test_scheduler tickets\n");
++    exit(1);
++  }
++
++  int tickets = atoi(argv[1]);
++  
++  if(tickets < 1){
++    fprintf(2, "tickets must be at least 1\n");
++    exit(1);
++  }
++
++  // Set the ticket count for this process
++  if(settickets(tickets) < 0){
++    fprintf(2, "settickets failed\n");
++    exit(1);
++  }
++
++  // Spin in an infinite loop
++  while(1) {
++    // Just consume CPU time
++  }
++
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index ac84de9..3d6ca08 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,7 @@ int getpid(void);
+ char* sys_sbrk(int,int);
+ int pause(int);
+ int uptime(void);
++int settickets(int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..087dd83 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("settickets");
