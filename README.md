@@ -109,7 +109,6 @@ This repository currently has **0 open issues** and **0 open pull requests**.
 
 ## Notes
 
-- There is **no top-level `README.md`** currently in the repository root (this draft is intended to become it).
 - Some folders (e.g., xv6) may include upstream code and licensing in addition to the repository’s MIT license at the root.
 
 ## License
